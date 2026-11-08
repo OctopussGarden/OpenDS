@@ -665,6 +665,9 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 	// The read loop owns this map. Multi-packet IN URBs must consume contiguous
 	// audio in submission order, not interleave their packets across goroutines.
 	isocInTail := make(map[uint32]<-chan struct{})
+	// OUT must keep the host's PCM order too. Goroutine scheduling and the
+	// pacer's mutex do not preserve submission order by themselves.
+	isocOutTail := make(map[uint32]<-chan struct{})
 
 	var outPayloadScratch []byte
 
@@ -896,13 +899,33 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 			pacer := p.(*isocPacer)
 			// The payload aliases the reusable read scratch buffer, so the
 			// deferred completion needs its own copy.
-			payloadCopy := append([]byte(nil), outPayload...)
+			payloadCopy, packetActuals, err := compactIsoOut(outPayload, isoReq, nPkts)
+			if err != nil {
+				return err
+			}
+			previous := isocOutTail[ep]
+			completed := make(chan struct{})
+			isocOutTail[ep] = completed
 			urbCtx, urbCancel := context.WithCancel(ctx)
 			pendingMu.Lock()
 			pending[seq] = urbCancel
 			pendingMu.Unlock()
 			go func(seq uint32, outPayload []byte, nPkts uint32, isoReq []byte) {
 				defer urbCancel()
+				defer close(completed)
+				defer func() {
+					pendingMu.Lock()
+					delete(pending, seq)
+					pendingMu.Unlock()
+				}()
+				// Keep the predecessor barrier even if this URB is cancelled:
+				// otherwise a later URB could overtake a still-running first one.
+				if previous != nil {
+					<-previous
+				}
+				if urbCtx.Err() != nil {
+					return
+				}
 				if !pacer.wait(urbCtx, nPkts) {
 					return
 				}
@@ -910,10 +933,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 					return
 				}
 				_ = s.processSubmit(urbCtx, dev, ep, dir, nil, outPayload)
-				pendingMu.Lock()
-				delete(pending, seq)
-				pendingMu.Unlock()
-				if err := writeRet(seq, uint32(len(outPayload)), nil, true, nPkts, isoReq, uint32(len(outPayload)), nil); err != nil {
+				if err := writeRet(seq, uint32(len(outPayload)), nil, true, nPkts, isoReq, uint32(len(outPayload)), packetActuals); err != nil {
 					if isClientDisconnect(err) {
 						s.logger.Debug("URB completion after disconnect", "seq", seq, "error", err)
 					} else {
@@ -937,6 +957,32 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 			return err
 		}
 	}
+}
+
+// compactIsoOut copies only packet data, never the gaps in a host's transfer
+// buffer. Padding is not PCM and can otherwise become periodic loud clicks.
+func compactIsoOut(payload, descriptors []byte, count uint32) ([]byte, []uint32, error) {
+	if count > maxIsoPackets || len(descriptors) != int(count)*isoDescSize {
+		return nil, nil, fmt.Errorf("invalid isochronous OUT descriptors")
+	}
+	packed := make([]byte, 0, len(payload))
+	actuals := make([]uint32, count)
+	var previousEnd uint64
+	for i := uint32(0); i < count; i++ {
+		d := descriptors[i*isoDescSize:]
+		offset := uint64(binary.BigEndian.Uint32(d[:4]))
+		length := uint64(binary.BigEndian.Uint32(d[4:8]))
+		end := offset + length
+		if end > uint64(len(payload)) || (length > 0 && offset < previousEnd) {
+			return nil, nil, fmt.Errorf("invalid isochronous OUT packet %d bounds", i)
+		}
+		packed = append(packed, payload[offset:end]...)
+		actuals[i] = uint32(length)
+		if length > 0 {
+			previousEnd = end
+		}
+	}
+	return packed, actuals, nil
 }
 
 // buildIsoReply encodes the isochronous packet descriptors for RET_SUBMIT:

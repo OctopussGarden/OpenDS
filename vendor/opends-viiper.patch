@@ -793,6 +793,120 @@ index 4a9bad22c05354bd29a5382a064fd67484943ef9..146af925ec48cb730fe25307cd513796
  
  require (
  	fyne.io/systray v1.12.2
+diff --git b/internal/server/usb/audio_out_test.go b/internal/server/usb/audio_out_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e28ffbb463cb93a8a7023e31a025e8725e097ec3
+--- /dev/null
++++ b/internal/server/usb/audio_out_test.go
+@@ -0,0 +1,108 @@
++package usb
++
++import (
++	"context"
++	"encoding/binary"
++	"io"
++	"log/slog"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	usbdesc "github.com/DualSenseClient/VIIPER/usb"
++	"github.com/DualSenseClient/VIIPER/virtualbus"
++	"github.com/stretchr/testify/require"
++)
++
++func TestIsoOutSkipsPaddingAndCopiesScratchBuffer(t *testing.T) {
++	input := []byte{1, 0, 2, 0, 3, 0, 4, 0, 255, 127, 255, 127, 255, 127, 255, 127, 5, 0, 6, 0, 7, 0, 8, 0}
++	descriptors := isoReq(8, 8)
++	binary.BigEndian.PutUint32(descriptors[16:20], 16)
++	got, actuals, err := compactIsoOut(input, descriptors, 2)
++	require.NoError(t, err)
++	require.Equal(t, []byte{1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0}, got)
++	require.Equal(t, []uint32{8, 8}, actuals)
++	input[0] = 99
++	require.Equal(t, byte(1), got[0])
++}
++
++func TestIsoOutRejectsInvalidPacketBounds(t *testing.T) {
++	for _, offset := range []uint32{4, 40, 0xfffffff8} {
++		descriptors := isoReq(8, 8)
++		binary.BigEndian.PutUint32(descriptors[16:20], offset)
++		_, _, err := compactIsoOut(make([]byte, 24), descriptors, 2)
++		require.Error(t, err)
++	}
++}
++
++type orderedAudioDevice struct {
++	entered  chan struct{}
++	release  chan struct{}
++	received chan byte
++}
++
++func (d *orderedAudioDevice) GetDescriptor() *usbdesc.Descriptor    { return mixedEndpointDescriptor() }
++func (d *orderedAudioDevice) GetDeviceSpecificArgs() map[string]any { return nil }
++func (d *orderedAudioDevice) HandleTransfer(ctx context.Context, ep, dir uint32, out []byte) []byte {
++	if out[0] == 1 {
++		close(d.entered)
++		select {
++		case <-d.release:
++		case <-ctx.Done():
++			return nil
++		}
++	}
++	d.received <- out[0]
++	return nil
++}
++
++func TestIsoOutCannotOvertakeAnEarlierAudioCallback(t *testing.T) {
++	d := &orderedAudioDevice{make(chan struct{}), make(chan struct{}), make(chan byte, 2)}
++	var release sync.Once
++	unblock := func() { release.Do(func() { close(d.release) }) }
++	t.Cleanup(unblock)
++	bus := virtualbus.New(9821)
++	defer bus.Close()
++	_, err := bus.Add(d)
++	require.NoError(t, err)
++	server := New(ServerConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
++	require.NoError(t, server.AddBus(bus))
++	host, peer := net.Pipe()
++	defer host.Close()
++	defer peer.Close()
++	go func() { _ = server.handleUrbStream(peer, d) }()
++	go func() { _, _ = io.Copy(io.Discard, host) }()
++	require.NoError(t, host.SetWriteDeadline(time.Now().Add(2*time.Second)))
++	submit := func(seq uint32, value byte) {
++		header := make([]byte, 48)
++		for offset, value := range map[int]uint32{0: 1, 4: seq, 16: 1, 24: 8, 32: 1} {
++			binary.BigEndian.PutUint32(header[offset:offset+4], value)
++		}
++		packet := append(header, []byte{value, 0, 0, 0, 0, 0, 0, 0}...)
++		packet = append(packet, isoReq(8)...)
++		_, err := host.Write(packet)
++		require.NoError(t, err)
++	}
++	submit(1, 1)
++	select {
++	case <-d.entered:
++	case <-time.After(time.Second):
++		t.Fatal("first audio packet not delivered")
++	}
++	submit(2, 2)
++	select {
++	case <-d.received:
++		t.Fatal("second audio packet overtook the first")
++	case <-time.After(25 * time.Millisecond):
++	}
++	unblock()
++	for _, want := range []byte{1, 2} {
++		select {
++		case got := <-d.received:
++			require.Equal(t, want, got)
++		case <-time.After(time.Second):
++			t.Fatal("audio queue stalled")
++		}
++	}
++}
 diff --git a/internal/server/usb/iso_test.go b/internal/server/usb/iso_test.go
 index 8e8cbed97d7bddac0a024b6217e06e544133757e..08f51f7d6e3dcee10dfdd8b5e6445baff987c317 100644
 --- a/internal/server/usb/iso_test.go
@@ -855,7 +969,7 @@ index 8e8cbed97d7bddac0a024b6217e06e544133757e..08f51f7d6e3dcee10dfdd8b5e6445baf
  
  func mixedEndpointDescriptor() *usbdesc.Descriptor {
 diff --git a/internal/server/usb/server.go b/internal/server/usb/server.go
-index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf4110733d91dc19 100644
+index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..835125fe538d9e82317efa5708c776704f9f1fc9 100644
 --- a/internal/server/usb/server.go
 +++ b/internal/server/usb/server.go
 @@ -611,7 +611,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
@@ -876,17 +990,20 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  				return fmt.Errorf("write RET_SUBMIT iso descriptors: %w", err)
  			}
  		}
-@@ -662,6 +662,9 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+@@ -662,6 +662,12 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
  
  	// One frame clock per isochronous endpoint, shared by concurrent URBs.
  	var isocPacers sync.Map // uint32 (ep) -> *isocPacer
 +	// The read loop owns this map. Multi-packet IN URBs must consume contiguous
 +	// audio in submission order, not interleave their packets across goroutines.
 +	isocInTail := make(map[uint32]<-chan struct{})
++	// OUT must keep the host's PCM order too. Goroutine scheduling and the
++	// pacer's mutex do not preserve submission order by themselves.
++	isocOutTail := make(map[uint32]<-chan struct{})
  
  	var outPayloadScratch []byte
  
-@@ -786,15 +789,34 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+@@ -786,15 +792,34 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
  			pendingMu.Unlock()
  			interval := endpointInterval(dev.GetDescriptor(), ep)
  			var pacer *isocPacer
@@ -921,7 +1038,7 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  					// Isochronous IN: one packet per USB frame. Each packet is a
  					// separate service opportunity, so the device is asked once
  					// per frame and the reply is held until that frame elapses.
-@@ -809,6 +831,10 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+@@ -809,6 +834,10 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
  						if urbCtx.Err() != nil {
  							return
  						}
@@ -932,7 +1049,7 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  						respData = append(respData, part...)
  					}
  				} else {
-@@ -850,7 +876,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+@@ -850,7 +879,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
  				delete(pending, seq)
  				pendingMu.Unlock()
  
@@ -941,16 +1058,54 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  					if isClientDisconnect(err) {
  						s.logger.Debug("URB completion after disconnect", "seq", seq, "error", err)
  					} else {
-@@ -887,7 +913,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
- 				pendingMu.Lock()
- 				delete(pending, seq)
- 				pendingMu.Unlock()
+@@ -870,13 +899,33 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+ 			pacer := p.(*isocPacer)
+ 			// The payload aliases the reusable read scratch buffer, so the
+ 			// deferred completion needs its own copy.
+-			payloadCopy := append([]byte(nil), outPayload...)
++			payloadCopy, packetActuals, err := compactIsoOut(outPayload, isoReq, nPkts)
++			if err != nil {
++				return err
++			}
++			previous := isocOutTail[ep]
++			completed := make(chan struct{})
++			isocOutTail[ep] = completed
+ 			urbCtx, urbCancel := context.WithCancel(ctx)
+ 			pendingMu.Lock()
+ 			pending[seq] = urbCancel
+ 			pendingMu.Unlock()
+ 			go func(seq uint32, outPayload []byte, nPkts uint32, isoReq []byte) {
+ 				defer urbCancel()
++				defer close(completed)
++				defer func() {
++					pendingMu.Lock()
++					delete(pending, seq)
++					pendingMu.Unlock()
++				}()
++				// Keep the predecessor barrier even if this URB is cancelled:
++				// otherwise a later URB could overtake a still-running first one.
++				if previous != nil {
++					<-previous
++				}
++				if urbCtx.Err() != nil {
++					return
++				}
+ 				if !pacer.wait(urbCtx, nPkts) {
+ 					return
+ 				}
+@@ -884,10 +933,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+ 					return
+ 				}
+ 				_ = s.processSubmit(urbCtx, dev, ep, dir, nil, outPayload)
+-				pendingMu.Lock()
+-				delete(pending, seq)
+-				pendingMu.Unlock()
 -				if err := writeRet(seq, uint32(len(outPayload)), nil, true, nPkts, isoReq, uint32(len(outPayload))); err != nil {
-+				if err := writeRet(seq, uint32(len(outPayload)), nil, true, nPkts, isoReq, uint32(len(outPayload)), nil); err != nil {
++				if err := writeRet(seq, uint32(len(outPayload)), nil, true, nPkts, isoReq, uint32(len(outPayload)), packetActuals); err != nil {
  					if isClientDisconnect(err) {
  						s.logger.Debug("URB completion after disconnect", "seq", seq, "error", err)
  					} else {
-@@ -907,17 +933,18 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
+@@ -907,17 +953,44 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
  			isoActual = uint32(len(outPayload))
  			respData = nil
  		}
@@ -961,6 +1116,32 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  	}
  }
  
++// compactIsoOut copies only packet data, never the gaps in a host's transfer
++// buffer. Padding is not PCM and can otherwise become periodic loud clicks.
++func compactIsoOut(payload, descriptors []byte, count uint32) ([]byte, []uint32, error) {
++	if count > maxIsoPackets || len(descriptors) != int(count)*isoDescSize {
++		return nil, nil, fmt.Errorf("invalid isochronous OUT descriptors")
++	}
++	packed := make([]byte, 0, len(payload))
++	actuals := make([]uint32, count)
++	var previousEnd uint64
++	for i := uint32(0); i < count; i++ {
++		d := descriptors[i*isoDescSize:]
++		offset := uint64(binary.BigEndian.Uint32(d[:4]))
++		length := uint64(binary.BigEndian.Uint32(d[4:8]))
++		end := offset + length
++		if end > uint64(len(payload)) || (length > 0 && offset < previousEnd) {
++			return nil, nil, fmt.Errorf("invalid isochronous OUT packet %d bounds", i)
++		}
++		packed = append(packed, payload[offset:end]...)
++		actuals[i] = uint32(length)
++		if length > 0 {
++			previousEnd = end
++		}
++	}
++	return packed, actuals, nil
++}
++
  // buildIsoReply encodes the isochronous packet descriptors for RET_SUBMIT:
 -// offset/length echoed from the request template, status forced to 0, and
 -// actual_length set from actualTotal distributed across packets in request
@@ -974,7 +1155,7 @@ index 7e49faf606d6e108a6851592ed1ef14950eb5bcb..b0252dceb70deca7525f782edf411073
  	out := make([]byte, len(tmpl))
  	copy(out, tmpl)
  	remaining := actualTotal
-@@ -925,12 +952,15 @@ func buildIsoReply(tmpl []byte, nPkts uint32, actualTotal uint32) []byte {
+@@ -925,12 +998,15 @@ func buildIsoReply(tmpl []byte, nPkts uint32, actualTotal uint32) []byte {
  		o := i * isoDescSize
  		reqLen := binary.BigEndian.Uint32(out[o+4 : o+8])
  		actual := reqLen
