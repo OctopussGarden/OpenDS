@@ -137,8 +137,18 @@ need acceptance testing with a real paired pad.
 
 For startup, enable **Run in the tray when Ubuntu starts** in General settings.
 This creates `~/.config/autostart/io.github.OpenDS.desktop` for the current user.
-USB/IP still needs administrator authentication when a controller connects.
-There is no passwordless privilege policy installed by this project.
+Run `python3 scripts/setup-user-bridge.py` once to install the dedicated bridge
+helper and policy for your desktop account (one administrator authentication).
+Subsequent bridge start, port discovery and stop require no password in your
+active local session. The helper accepts only a caller-owned IPv4-loopback
+DualSense/Edge export and can detach only the ports it recorded for that caller.
+It does not grant generic passwordless sudo or remote USB/IP access. Existing
+installations without this helper retain the administrator-prompt fallback.
+
+Audio OUT transfers preserve host submission order and omit packet-buffer
+padding before PCM delivery. This avoids corruption shared by speaker and
+headphone playback. These changes apply to the OpenDS Bluetooth bridge; a
+physical controller connected directly by USB uses the kernel's audio path.
 
 ## Troubleshooting
 

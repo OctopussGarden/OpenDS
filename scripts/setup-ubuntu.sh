@@ -33,4 +33,5 @@ udevadm control --reload-rules
 udevadm trigger --subsystem-match=hidraw
 udevadm trigger --subsystem-match=input
 udevadm settle
+/usr/bin/python3 -I "$(dirname -- "${BASH_SOURCE[0]}")/setup-user-bridge.py"
 echo 'OpenDS Ubuntu setup complete. Reconnect your Bluetooth DualSense, then run ./opends doctor.'

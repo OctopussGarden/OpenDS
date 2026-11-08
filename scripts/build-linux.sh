@@ -20,4 +20,6 @@ mkdir -p target/release/ui
 cp src/linux/graphics.py target/release/ui/graphics.py
 cp assets/opends.png target/release/opends.png
 cp scripts/setup-ubuntu.sh target/release/setup-ubuntu.sh
+cp scripts/setup-user-bridge.py target/release/setup-user-bridge.py
+cp src/linux/opends_usbip_helper.py target/release/opends-usbip-helper.py
 printf 'Built %s/target/release/opends\nRun ./opends to open the desktop window.\n' "$root"

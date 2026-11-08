@@ -55,6 +55,11 @@ pub fn summary(config: &crate::config::Config) -> String {
         "Logs: {}",
         crate::linux::state_dir().join("logs/opends.log").display()
     ));
-    lines.push("USB/IP attach/detach uses the desktop's administrator authentication dialog.\nPhysical input grabs cover evdev; disable Steam Input and SDL HIDAPI in games to prevent direct hidraw duplicates.".into());
+    lines.push(if std::path::Path::new("/usr/local/libexec/opends-usbip").is_file() {
+        "Bridge permissions: dedicated OpenDS helper installed; active local user operations need no password.".into()
+    } else {
+        "Bridge permissions: run setup-user-bridge.py once to enable prompt-free local bridge operations.".into()
+    });
+    lines.push("Physical input grabs cover evdev; disable Steam Input and SDL HIDAPI in games to prevent direct hidraw duplicates.".into());
     lines.join("\n")
 }

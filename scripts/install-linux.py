@@ -27,7 +27,7 @@ def install(prefix=None):
     data = prefix / "share" if prefix != Path.home() / ".local" else Path(os.environ.get("XDG_DATA_HOME", str(prefix / "share")))
     app = prefix / "lib/opends"
     build = ROOT / "target/release"
-    required = ["opends", "libVIIPER.so", "opends.png", "setup-ubuntu.sh", "ui/graphics.py"]
+    required = ["opends", "libVIIPER.so", "opends.png", "setup-ubuntu.sh", "setup-user-bridge.py", "opends-usbip-helper.py", "ui/graphics.py"]
     for filename in required:
         if not (build / filename).is_file():
             raise SystemExit(f"Missing {filename}. Run ./scripts/build-linux.sh first.")

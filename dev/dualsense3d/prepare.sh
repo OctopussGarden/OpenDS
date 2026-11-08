@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 project=$(cd -- "$root/../.." && pwd)
 if [[ ! -f "$root/backend/opends" ]]; then
-    for required in opends libVIIPER.so opends.png setup-ubuntu.sh ui/graphics.py; do
+    for required in opends libVIIPER.so opends.png setup-ubuntu.sh setup-user-bridge.py opends-usbip-helper.py ui/graphics.py; do
         if [[ ! -f "$project/target/release/$required" ]]; then
             "$project/scripts/build-linux.sh"
             break
@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil,sys
 project,destination=map(Path,sys.argv[1:])
 destination.mkdir(parents=True,exist_ok=True)
-for name in ['opends','libVIIPER.so','opends.png','setup-ubuntu.sh','ui/graphics.py']:
+for name in ['opends','libVIIPER.so','opends.png','setup-ubuntu.sh','setup-user-bridge.py','opends-usbip-helper.py','ui/graphics.py']:
     target=destination/name;target.parent.mkdir(parents=True,exist_ok=True)
     shutil.copy2(project/'target/release'/name,target)
 for name in ['LICENSE','THIRD-PARTY.md']:

@@ -1,5 +1,6 @@
 //! Linux usbip has neither --once/--terse nor the Windows port numbering.
 use std::{
+    os::unix::fs::MetadataExt,
     path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -11,15 +12,33 @@ fn run(
     privileged: bool,
     cancelled: impl Fn() -> bool,
 ) -> Result<Output, String> {
-    let mut command = if privileged && unsafe { libc::geteuid() } != 0 {
+    let helper = Path::new("/usr/local/libexec/opends-usbip");
+    let helper_args = helper_arguments(args);
+    let trusted_helper = helper
+        .metadata()
+        .is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0);
+    let use_helper = trusted_helper && helper_args.is_some();
+    let mut command = if use_helper {
+        let mut command = if unsafe { libc::geteuid() } != 0 {
+            let mut command = Command::new("pkexec");
+            command.arg(helper);
+            command
+        } else {
+            Command::new(helper)
+        };
+        command.args(helper_args.unwrap());
+        command
+    } else if privileged && unsafe { libc::geteuid() } != 0 {
         let mut command = Command::new("pkexec");
         command.arg(exe);
         command
     } else {
         Command::new(exe)
     };
+    if !use_helper {
+        command.args(args);
+    }
     let mut child = command
-        .args(args)
         .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -52,6 +71,26 @@ fn run(
             return Err("USB/IP operation cancelled or timed out".into());
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn helper_arguments(args: &[String]) -> Option<Vec<String>> {
+    match args {
+        [op] if op == "port" => Some(vec!["port".into()]),
+        [op, flag, port] if op == "detach" && flag == "-p" => {
+            Some(vec!["detach".into(), port.clone()])
+        }
+        [flag, port, op, remote, host, busflag, bus]
+            if flag == "--tcp-port"
+                && op == "attach"
+                && remote == "-r"
+                && host == "127.0.0.1"
+                && busflag == "-b" =>
+        {
+            bus.strip_suffix("-1")
+                .map(|bus| vec!["attach".into(), port.clone(), bus.into()])
+        }
+        _ => None,
     }
 }
 fn owned_ports(text: &str, service: u16, bus: u32) -> Vec<u32> {
@@ -174,6 +213,36 @@ pub fn cleanup_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn helper_maps_only_supported_loopback_operations() {
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            helper_arguments(&args(&[
+                "--tcp-port",
+                "3242",
+                "attach",
+                "-r",
+                "127.0.0.1",
+                "-b",
+                "1-1"
+            ])),
+            Some(args(&["attach", "3242", "1"]))
+        );
+        assert_eq!(
+            helper_arguments(&args(&["detach", "-p", "0"])),
+            Some(args(&["detach", "0"]))
+        );
+        assert!(helper_arguments(&args(&[
+            "--tcp-port",
+            "3242",
+            "attach",
+            "-r",
+            "remote",
+            "-b",
+            "1-1"
+        ]))
+        .is_none());
+    }
     #[test]
     fn only_our_sony_loopback_endpoint_is_owned_and_port_zero_is_valid() {
         // Actual Linux output prefixes the URL with the local USB bus ID.
