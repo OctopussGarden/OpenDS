@@ -63,7 +63,7 @@ def entries(text):
 
 
 def valid_export(text,bus):
-    return re.search(r'^\s*-\s*'+str(bus)+r'-1:\s*[^\n]*\(054c:(?:0ce6|0df2)\)',text,re.I|re.M) is not None
+    return re.search(r'^[ \t]*(?:-[ \t]+)?'+str(bus)+r'-1:[ \t]*[^\n]*\(054c:(?:0ce6|0df2)\)',text,re.I|re.M) is not None
 
 
 def records(uid):

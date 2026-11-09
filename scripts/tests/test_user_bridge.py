@@ -12,6 +12,7 @@ ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('bridge_helper',ROOT/'src/linux/opends_usbip_helper.py')
 helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
 LISTING='Port 00: <Port in Use> at High Speed(480Mbps)\n Sony (054c:0ce6)\n 8-1 -> usbip://127.0.0.1:3242/1-1\n'
+EXPORT='Exportable USB devices\n======================\n - 127.0.0.1\n        1-1: Sony Corp. : DualSense wireless controller (PS5) (054c:0ce6)\n           : /sys/devices/pci0000:00/usb1/1-1\n'
 
 
 class UserBridge(unittest.TestCase):
@@ -26,9 +27,12 @@ class UserBridge(unittest.TestCase):
   self.assertFalse(helper.owned_listener(1000,3243,table))
   self.assertFalse(helper.owned_listener(1000,3242,table.replace('0100007F','00000000')))
  def test_only_exact_sony_export_and_loopback_port_are_matched(self):
+  self.assertTrue(helper.valid_export(EXPORT,1))
   self.assertTrue(helper.valid_export(' - 1-1: Sony : DualSense (054c:0ce6)',1))
   self.assertFalse(helper.valid_export(' - 1-10: Sony (054c:0ce6)',1))
   self.assertFalse(helper.valid_export(' - 1-1: Other (1234:5678)',1))
+  self.assertFalse(helper.valid_export(EXPORT,2))
+  self.assertFalse(helper.valid_export(' 1-1: Other (1234:5678)\n 2-1: Sony (054c:0ce6)',1))
   self.assertEqual(helper.entries(LISTING)[0][:2],(3242,1))
   self.assertEqual(helper.entries(LISTING.replace('127.0.0.1','remote')), {})
  def test_cannot_detach_other_users_or_reassigned_ports(self):
@@ -42,7 +46,7 @@ class UserBridge(unittest.TestCase):
     self.assertEqual(command.call_count,1)
  def test_attach_records_ownership_and_detach_is_scoped(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(helper,'RUNTIME',Path(directory)):
-   outputs=['Imported USB devices\n',' - 1-1: Sony (054c:0ce6)\n','',LISTING]
+   outputs=['Imported USB devices\n',EXPORT,'',LISTING]
    with patch.object(helper,'owned_listener',return_value=True),patch.object(helper,'command',side_effect=outputs) as command:
     helper.operate(1000,'attach',['3242','1'],'usbip')
     self.assertEqual(command.call_args_list[2].args,('usbip','--tcp-port','3242','attach','-r','127.0.0.1','-b','1-1'))
